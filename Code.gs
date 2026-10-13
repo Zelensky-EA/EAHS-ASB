@@ -169,6 +169,36 @@ function submitMovement(token,input) {
   } finally {lock.releaseLock();}
 }
 
+// Full physical count. Each line carries the system stock shown when that item
+// was counted (expected). The correction is counted - expected, so sales or
+// deliveries recorded after an item was counted still apply on top of it.
+function submitCount(token,input) {
+  const session=auth_(token,true), lock=LockService.getScriptLock(); lock.waitLock(30000);
+  try {
+    auth_(token,true);
+    const request=text_(input.request,100); if(!request) throw Error('Missing request identifier.');
+    const state=state_(); if(state.logs.some(l=>l.id===request)) return {ok:true,duplicate:true};
+    const date=text_(input.date,10), shift=text_(input.shift,80), note=text_(input.note,500);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!shift) throw Error('Date and count label are required.');
+    if(!Array.isArray(input.counts)||!input.counts.length||input.counts.length>2000) throw Error('Count at least one item.');
+    const seen={}, lines=input.counts.map(x=>{
+      const product=state.products.find(p=>p.id===x.id);
+      if(!product||!product.active) throw Error('An item is no longer active. Refresh inventory.');
+      if(seen[x.id]) throw Error('Duplicate product.'); seen[x.id]=true;
+      const counted=n_(x.counted,true), expected=Number(x.expected);
+      if(counted>100000) throw Error('Count is too large.');
+      if(!Number.isSafeInteger(expected)) throw Error('Count data is incomplete. Refresh and re-enter the count.');
+      const delta=counted-expected, label=[product.name,product.size,product.color].filter(Boolean).join(' ');
+      if(product.stock+delta<0) throw Error(label+': stock changed after it was counted. Recount it.');
+      return {id:product.id,sku:product.sku,name:product.name,size:product.size,color:product.color,expected,counted,delta,price:product.price,cost:product.cost,laterChange:product.stock-expected};
+    });
+    const details={date,shift,note,lines,revenue:0,uncounted:state.products.filter(p=>p.active&&!seen[p.id]).length};
+    logRow_(request,'count',session.operator,details);
+    SpreadsheetApp.flush();
+    return {ok:true,changed:lines.filter(x=>x.delta).length,net:lines.reduce((s,x)=>s+x.delta,0)};
+  } finally {lock.releaseLock();}
+}
+
 function changeAccessCodes(token,input) {
   const session=auth_(token,true), student=String(input.student||''), adviser=String(input.adviser||'');
   if(!student&&!adviser) throw Error('Enter at least one new code.');
