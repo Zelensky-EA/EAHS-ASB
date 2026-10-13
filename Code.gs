@@ -1,5 +1,11 @@
 const PRODUCT_HEADERS = ['id','sku','name','category','size','color','location','cost','price','reorder','active','barcode'];
 const LOG_HEADERS = ['id','timestamp','type','operator','details'];
+// Google Sheets cells hold at most 50,000 characters. Long ledger entries
+// continue in the columns to the right; continuation cells start with '~'.
+const CELL_CHUNK = 45000;
+// Shared limit on incorrect access codes from ANYONE, per time window.
+const LOGIN_MAX_FAILURES = 25;
+const LOGIN_WINDOW_MS = 15*60*1000;
 
 function doGet() {
   return HtmlService.createHtmlOutputFromFile('Index').setTitle('ASB Student Store')
@@ -37,7 +43,11 @@ function rotateAccessCodes() {
     if(code) { if(code.length<10) throw Error('Use at least 10 characters.'); p.setProperty(role+'_hash',hash_(code)); p.deleteProperty(key); }
   });
   p.setProperty('auth_epoch',Utilities.getUuid());
+  p.deleteProperty('login_failures');
 }
+
+// Run from the editor if sign-in is paused after too many incorrect codes.
+function clearLoginLockout() { PropertiesService.getScriptProperties().deleteProperty('login_failures'); }
 
 function hash_(s) { return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(s))); }
 function db_() {
@@ -59,11 +69,20 @@ function auth_(token,adviser) {
 }
 function login(code,operator) {
   operator=text_(operator,80); if(!operator) throw Error('Enter your name or shift team.');
-  const cache=CacheService.getScriptCache(), key='attempt:'+hash_(String(code)), tries=Number(cache.get(key)||0);
-  if(tries>=10) throw Error('Too many attempts. Wait 10 minutes.');
-  const p=PropertiesService.getScriptProperties(), h=hash_(code);
-  const role=['adviser','student'].find(r=>p.getProperty(r+'_hash')===h);
-  if(!role) {cache.put(key,String(tries+1),600); throw Error('Incorrect access code.');}
+  code=String(code==null?'':code); if(!code) throw Error('Enter the access code.');
+  const p=PropertiesService.getScriptProperties(), lock=LockService.getScriptLock();
+  let role, failed=false; lock.waitLock(30000);
+  try {
+    // Counts every failed attempt, whatever code was guessed, so guessing many
+    // different codes is limited. Stored in properties (cache can be evicted).
+    const now=Date.now(); let f=JSON.parse(p.getProperty('login_failures')||'{"count":0,"start":0}');
+    if(now-f.start>LOGIN_WINDOW_MS) f={count:0,start:now};
+    if(f.count>=LOGIN_MAX_FAILURES) throw Error('Sign-in is paused after too many incorrect codes. Try again in '+Math.ceil((f.start+LOGIN_WINDOW_MS-now)/60000)+' minutes.');
+    const h=hash_(code); role=['adviser','student'].find(r=>p.getProperty(r+'_hash')===h);
+    if(!role) {f.count++; p.setProperty('login_failures',JSON.stringify(f)); failed=true;}
+  } finally {lock.releaseLock();}
+  if(failed) {Utilities.sleep(1500); throw Error('Incorrect access code.');}
+  const cache=CacheService.getScriptCache();
   const token=Utilities.getUuid()+Utilities.getUuid();
   cache.put('session:'+token,JSON.stringify({role,operator,epoch:p.getProperty('auth_epoch')||''}),21600);
   return {token,role,operator};
@@ -76,7 +95,9 @@ function safe_(v) {return typeof v==='string'&&/^[=+\-@]/.test(v)?"'"+v:v;}
 function state_() {
   const ss=db_(), products=objects_(ss.getSheetByName('Products')).map(p=>({...p,active:p.active===true||p.active==='TRUE',stock:0}));
   const byId=Object.fromEntries(products.map(p=>[p.id,p]));
-  const logs=objects_(ss.getSheetByName('Activity')).map(l=>({...l,details:JSON.parse(l.details)}));
+  const logs=ss.getSheetByName('Activity').getDataRange().getValues().slice(1).filter(r=>r[0]).map(r=>({
+    id:String(r[0]),timestamp:r[1] instanceof Date?r[1].toISOString():String(r[1]),type:String(r[2]),operator:String(r[3]),
+    details:JSON.parse(r.slice(4).map((c,i)=>{c=String(c);return i&&c[0]==='~'?c.slice(1):c;}).join(''))}));
   logs.forEach(l=>(l.details.lines||[]).forEach(x=>{if(byId[x.id]) byId[x.id].stock+=x.delta;}));
   return {products,logs};
 }
@@ -98,10 +119,22 @@ function saveProduct(token,input) {
     if(rows.some(x=>x.id!==id&&[x.sku,x.barcode].filter(Boolean).some(b=>keys.includes(barcodeKey_(b))))) throw Error('This barcode is already assigned to another product variant.');
     sheet.getRange(2,PRODUCT_HEADERS.length,Math.max(sheet.getLastRow(),1),1).setNumberFormat('@');
     const values=PRODUCT_HEADERS.map(k=>safe_(item[k]));
-    if(old) sheet.getRange(rows.findIndex(x=>x.id===id)+2,1,1,values.length).setValues([values]); else sheet.appendRow(values);
-    db_().getSheetByName('Activity').appendRow([Utilities.getUuid(),new Date().toISOString(),'product',safe_(session.operator),JSON.stringify({product:id,name:item.name,before:old||null,after:item})]);
+    if(old) {
+      // Match by id against raw rows so blank rows in the sheet can't shift the target.
+      const rowNumber=sheet.getRange(1,1,sheet.getLastRow(),1).getValues().findIndex(r=>String(r[0])===String(id))+1;
+      if(rowNumber<2) throw Error('Product no longer exists.');
+      sheet.getRange(rowNumber,1,1,values.length).setValues([values]);
+    } else sheet.appendRow(values);
+    logRow_(Utilities.getUuid(),'product',session.operator,{product:id,name:item.name,before:old||null,after:item});
     SpreadsheetApp.flush(); return {ok:true};
   } finally {lock.releaseLock();}
+}
+function logRow_(id,type,operator,details) {
+  const json=JSON.stringify(details), parts=[];
+  for(let i=0;i<json.length;i+=CELL_CHUNK) parts.push((i?'~':'')+json.slice(i,i+CELL_CHUNK));
+  const sheet=db_().getSheetByName('Activity'), row=[id,new Date().toISOString(),type,safe_(operator),...parts];
+  if(row.length>sheet.getMaxColumns()) sheet.insertColumnsAfter(sheet.getMaxColumns(),row.length-sheet.getMaxColumns());
+  sheet.appendRow(row);
 }
 function submitMovement(token,input) {
   const session=auth_(token,input.type!=='sale'), lock=LockService.getScriptLock(); lock.waitLock(30000);
@@ -131,7 +164,7 @@ function submitMovement(token,input) {
     const cash=input.type==='sale'?money_(input.cash):0, electronic=input.type==='sale'?money_(input.electronic):0;
     const details={date,shift,note,lines,revenue,cash,electronic,variance:Math.round((cash+electronic-revenue)*100)/100};
     // One append commits the complete shift. Stock is derived from this ledger.
-    db_().getSheetByName('Activity').appendRow([request,new Date().toISOString(),input.type,safe_(session.operator),JSON.stringify(details)]);
+    logRow_(request,input.type,session.operator,details);
     SpreadsheetApp.flush(); return {ok:true,revenue};
   } finally {lock.releaseLock();}
 }
