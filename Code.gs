@@ -37,18 +37,35 @@ function setupStore() {
 // To rotate access codes, add NEW_STUDENT_CODE / NEW_ADVISER_CODE in Project
 // Settings > Script properties, run this, then log in again.
 function rotateAccessCodes() {
-  const p=PropertiesService.getScriptProperties();
-  ['student','adviser'].forEach(role=>{
-    const key='NEW_'+role.toUpperCase()+'_CODE', code=p.getProperty(key);
-    if(code) { if(code.length<10) throw Error('Use at least 10 characters.'); p.setProperty(role+'_hash',hash_(code)); p.deleteProperty(key); }
-  });
+  const p=PropertiesService.getScriptProperties(), found=[];
+  const codes={student:p.getProperty('NEW_STUDENT_CODE'),adviser:p.getProperty('NEW_ADVISER_CODE')};
+  Object.keys(codes).forEach(role=>{ if(codes[role]!=null) { codes[role]=code_(codes[role]); if(codes[role].length<10) throw Error('NEW_'+role.toUpperCase()+'_CODE needs at least 10 characters. Nothing was changed.'); } });
+  if(codes.student==null&&codes.adviser==null) throw Error('No NEW_STUDENT_CODE or NEW_ADVISER_CODE found. In Project Settings > Script properties, add them, click "Save script properties", then run this again. Nothing was changed.');
+  const s=codes.student!=null?hash_(codes.student):p.getProperty('student_hash'), a=codes.adviser!=null?hash_(codes.adviser):p.getProperty('adviser_hash');
+  if(s===a) throw Error('Student and adviser codes must be different. Nothing was changed.');
+  Object.keys(codes).forEach(role=>{ if(codes[role]!=null) { p.setProperty(role+'_hash',hash_(codes[role])); p.deleteProperty('NEW_'+role.toUpperCase()+'_CODE'); found.push(role); } });
   p.setProperty('auth_epoch',Utilities.getUuid());
+  console.log('Updated '+found.join(' and ')+' code. Script ID: '+ScriptApp.getScriptId());
   p.deleteProperty('login_failures');
+}
+
+// Troubleshooting: add a script property CHECK_CODE holding the code you are
+// typing, run this, read the log. The property is deleted afterwards.
+function checkAccessCode() {
+  const p=PropertiesService.getScriptProperties(), raw=p.getProperty('CHECK_CODE');
+  if(raw==null) throw Error('Add a CHECK_CODE script property first and click "Save script properties".');
+  p.deleteProperty('CHECK_CODE');
+  const role=['adviser','student'].find(r=>p.getProperty(r+'_hash')===hash_(code_(raw)));
+  console.log('Script ID: '+ScriptApp.getScriptId());
+  console.log('Codes saved: student '+(p.getProperty('student_hash')?'yes':'NO')+', adviser '+(p.getProperty('adviser_hash')?'yes':'NO'));
+  console.log(role?'MATCH: this is the '+role+' code. If the store still rejects it, the /exec link belongs to a different project or deployment.':'NO MATCH: this is not the current student or adviser code.');
+  if(raw!==raw.trim()) console.log('Note: the value had spaces at the start or end; they are ignored.');
 }
 
 // Run from the editor if sign-in is paused after too many incorrect codes.
 function clearLoginLockout() { PropertiesService.getScriptProperties().deleteProperty('login_failures'); }
 
+function code_(v) { return String(v==null?'':v).trim(); }
 function hash_(s) { return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(s))); }
 function db_() {
   const id=PropertiesService.getScriptProperties().getProperty('STORE_SHEET_ID');
@@ -69,7 +86,7 @@ function auth_(token,adviser) {
 }
 function login(code,operator) {
   operator=text_(operator,80); if(!operator) throw Error('Enter your name or shift team.');
-  code=String(code==null?'':code); if(!code) throw Error('Enter the access code.');
+  code=code_(code); if(!code) throw Error('Enter the access code.');
   const p=PropertiesService.getScriptProperties(), lock=LockService.getScriptLock();
   let role, failed=false; lock.waitLock(30000);
   try {
@@ -200,7 +217,7 @@ function submitCount(token,input) {
 }
 
 function changeAccessCodes(token,input) {
-  const session=auth_(token,true), student=String(input.student||''), adviser=String(input.adviser||'');
+  const session=auth_(token,true), student=code_(input.student), adviser=code_(input.adviser);
   if(!student&&!adviser) throw Error('Enter at least one new code.');
   [student,adviser].forEach(code=>{if(code&&code.length<10) throw Error('Each code needs at least 10 characters.');});
   const lock=LockService.getScriptLock();lock.waitLock(30000);
